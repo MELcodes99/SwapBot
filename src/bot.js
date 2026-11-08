@@ -383,7 +383,8 @@ bot.callbackQuery(/^cx:(.+)$/, async (ctx) => {
   await ctx.editMessageText(STATUS_LABEL[status] + ' — order cancelled, remaining funds returned.\n\n🔗 https://solscan.io/tx/' + sig);
 });
 
-await bot.api.setMyCommands([
+try {
+  await bot.api.setMyCommands([
   { command: 'quote', description: 'Get best swap route, e.g. /quote 0.1 SOL USDC' },
   { command: 'balance', description: 'Show wallet SOL and USDC balances' },
   { command: 'dca', description: 'Recurring buys, e.g. /dca 20 USDC SOL 4 1d' },
@@ -392,5 +393,24 @@ await bot.api.setMyCommands([
   { command: 'wallet', description: 'Show the bot wallet address' },
   { command: 'help', description: 'How to use this bot' },
 ]);
-bot.start();
+} catch (e) {
+  console.warn('setMyCommands failed:', e.description || e.message);
+}
+async function startBot() {
+  for (;;) {
+    try {
+      await bot.start({ onStart: () => console.log('Polling started') });
+      return;
+    } catch (e) {
+      if (e.error_code === 409) {
+        console.warn('409 Conflict: another copy of this bot is running. Retrying in 15s…');
+        await new Promise((r) => setTimeout(r, 15_000));
+        continue;
+      }
+      console.error('Bot stopped:', e.description || e.message);
+      process.exit(1);
+    }
+  }
+}
+startBot();
 console.log(`Bot running. Wallet: ${wallet.publicKey.toBase58()}`);
