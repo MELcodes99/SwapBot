@@ -107,6 +107,9 @@ bot.command(['start', 'help'], (ctx) =>
       '💱 /quote 0.1 SOL USDC – best route (~$0.003)\n' +
       '🪙 /quote 5 USDC <mint> – any token by mint\n' +
       '💰 /balance – wallet balances\n' +
+      '📆 /dca 20 USDC SOL 4 1d – recurring buys\n' +
+      '🎯 /limit 10 USDC SOL 0.125 – limit order\n' +
+      '📋 /orders – view / cancel orders\n' +
       '👛 /wallet – bot wallet address\n\n' +
       '✅ Every swap asks you to confirm first.'
   )
@@ -230,9 +233,162 @@ setInterval(() => {
   for (const [id, p] of pending) if (Date.now() > p.expires) pending.delete(id);
 }, 60_000);
 
+// ---------- orders: DCA + limit ----------
+async function hermesGet(path) {
+  const res = await x402.fetch(HERMES + path, { method: 'GET' });
+  const text = await res.text();
+  if (!res.ok) throw new Error(path + ' → ' + res.status + ': ' + text.slice(0, 300));
+  return JSON.parse(text);
+}
+
+// Sign a base64 tx from Hermes and broadcast via our own RPC (free), then wait for confirmation.
+async function signSendConfirm(base64) {
+  const tx = VersionedTransaction.deserialize(Buffer.from(base64, 'base64'));
+  tx.sign([wallet]);
+  const sig = await connection.sendRawTransaction(tx.serialize(), { maxRetries: 3 });
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const s = (await connection.getSignatureStatuses([sig])).value[0];
+    if (s?.err) return { sig, status: 'failed' };
+    if (s?.confirmationStatus === 'confirmed' || s?.confirmationStatus === 'finalized') return { sig, status: 'confirmed' };
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return { sig, status: 'pending' };
+}
+
+const STATUS_LABEL = { confirmed: '✅ Confirmed', failed: '❌ Failed', pending: '⏳ Still pending after 60s' };
+const UNITS = { m: 'minute', h: 'hour', d: 'day', w: 'week' };
+const symbolOf = (mint) => Object.entries(TOKENS).find(([, t]) => t.mint === mint)?.[0] || mint.slice(0, 4) + '…';
+const decimalsOf = async (mint) => (await resolveToken(symbolOf(mint).endsWith('…') ? mint : symbolOf(mint))).decimals;
+
+// /dca 20 USDC SOL 4 1d  → spend 20 USDC on SOL in 4 slices, one every 1 day
+bot.command('dca', async (ctx) => {
+  const [amount, fromArg, toArg, slicesArg, every] = ctx.match.trim().split(/\s+/);
+  const m = /^(\d+)([mhdw])$/.exec(every || '');
+  const slices = Number(slicesArg);
+  if (!amount || !fromArg || !toArg || !Number.isInteger(slices) || slices < 1 || !m) {
+    return ctx.reply(
+      'ℹ️ Usage: /dca <total> <FROM> <TO> <slices> <interval>\n\n' +
+      'Example: /dca 20 USDC SOL 4 1d\n→ spend 20 USDC on SOL in 4 buys, one per day\n\n' +
+      '⏱️ Interval: 30m, 2h, 1d, 1w'
+    );
+  }
+  const from = await resolveToken(fromArg);
+  const to = await resolveToken(toArg);
+  const body = {
+    maker: wallet.publicKey.toBase58(),
+    inputMint: from.mint,
+    outputMint: to.mint,
+    inputAmount: toAtomic(amount, from.decimals),
+    sliceCount: slices,
+    frequency: Number(m[1]),
+    frequencyUnit: UNITS[m[2]],
+  };
+  const per = fromAtomic((BigInt(body.inputAmount) / BigInt(slices)).toString(), from.decimals);
+  const id = Math.random().toString(36).slice(2, 10);
+  pending.set(id, { kind: 'dca', body, expires: Date.now() + 5 * 60_000 });
+  await ctx.reply(
+    '📆 DCA order\n\n' +
+    '💸 Total: ' + amount + ' ' + from.symbol + ' → ' + to.symbol + '\n' +
+    '🔪 ' + slices + ' buys of ~' + per + ' ' + from.symbol + '\n' +
+    '⏱️ Every ' + m[1] + ' ' + UNITS[m[2]] + (m[1] === '1' ? '' : 's') + ', starting now\n\n' +
+    '🤖 Swap.io keepers execute each buy on-chain — the bot does not need to stay online.\n' +
+    '💰 The full ' + amount + ' ' + from.symbol + ' is locked in the order until filled or cancelled.',
+    { reply_markup: new InlineKeyboard().text('✅ Create DCA', 'ord:' + id).text('❌ Cancel', 'no:' + id) }
+  );
+});
+
+// /limit 10 USDC SOL 0.125  → sell 10 USDC for at least 0.125 SOL (fills when price is good enough)
+bot.command('limit', async (ctx) => {
+  const [amount, fromArg, toArg, minOut] = ctx.match.trim().split(/\s+/);
+  if (!amount || !fromArg || !toArg || !minOut) {
+    return ctx.reply(
+      'ℹ️ Usage: /limit <amount> <FROM> <TO> <receive>\n\n' +
+      'Example: /limit 10 USDC SOL 0.125\n→ sell 10 USDC only if you get at least 0.125 SOL\n(= buy SOL at $80 or better)'
+    );
+  }
+  const from = await resolveToken(fromArg);
+  const to = await resolveToken(toArg);
+  const body = {
+    maker: wallet.publicKey.toBase58(),
+    inputMint: from.mint,
+    outputMint: to.mint,
+    inputAmount: toAtomic(amount, from.decimals),
+    outputAmount: toAtomic(minOut, to.decimals),
+    orderType: 0,
+  };
+  const price = Number(amount) / Number(minOut);
+  const id = Math.random().toString(36).slice(2, 10);
+  pending.set(id, { kind: 'limit', body, expires: Date.now() + 5 * 60_000 });
+  await ctx.reply(
+    '🎯 Limit order\n\n' +
+    '📤 Sell: ' + amount + ' ' + from.symbol + '\n' +
+    '📥 For at least: ' + minOut + ' ' + to.symbol + '\n' +
+    '🏷️ Price: ' + price.toPrecision(6) + ' ' + from.symbol + ' per ' + to.symbol + '\n\n' +
+    '⏳ Stays open until filled or cancelled. Funds are locked in the order meanwhile.',
+    { reply_markup: new InlineKeyboard().text('✅ Place order', 'ord:' + id).text('❌ Cancel', 'no:' + id) }
+  );
+});
+
+bot.callbackQuery(/^ord:(.+)$/, async (ctx) => {
+  const id = ctx.match[1];
+  const p = pending.get(id);
+  pending.delete(id);
+  await ctx.answerCallbackQuery();
+  if (!p) return ctx.editMessageText('🤷 Order not found. Send the command again.');
+  if (Date.now() > p.expires) return ctx.editMessageText('⌛ Expired. Send the command again.');
+
+  await ctx.editMessageText('🛠️ Building order…');
+  const path = p.kind === 'dca' ? '/v1/orders/dca/create' : '/v1/orders/limit/create';
+  const built = await hermes(path, p.body);
+  if (!built.transaction) throw new Error('No transaction returned for ' + path);
+
+  await ctx.editMessageText('📡 Sending to Solana…');
+  const { sig, status } = await signSendConfirm(built.transaction);
+  const what = p.kind === 'dca' ? '📆 DCA order' : '🎯 Limit order';
+  await ctx.editMessageText(
+    STATUS_LABEL[status] + ' — ' + what + ' created\n\n🔗 https://solscan.io/tx/' + sig + '\n\n📋 Use /orders to view or cancel it.'
+  );
+});
+
+// /orders → list open orders with cancel buttons
+bot.command('orders', async (ctx) => {
+  const msg = await ctx.reply('🔎 Loading orders…');
+  const data = await hermesGet('/v1/orders?maker=' + wallet.publicKey.toBase58() + '&pageSize=20');
+  const open = (data.data || []).filter((o) => o.isOpen);
+  if (!open.length) return ctx.api.editMessageText(ctx.chat.id, msg.message_id, '📭 No open orders.');
+
+  const kb = new InlineKeyboard();
+  const lines = [];
+  for (const [i, o] of open.entries()) {
+    const inSym = symbolOf(o.inputMint), outSym = symbolOf(o.outputMint);
+    const inDec = await decimalsOf(o.inputMint), outDec = await decimalsOf(o.outputMint);
+    const kind = o.dca ? '📆 DCA' : '🎯 Limit';
+    lines.push(
+      (i + 1) + '. ' + kind + ' ' + inSym + ' → ' + outSym + '\n' +
+      '   💸 Left: ' + fromAtomic(o.remainingInputAmount, inDec) + ' / ' + fromAtomic(o.initialInputAmount, inDec) + ' ' + inSym + '\n' +
+      '   📥 Received: ' + fromAtomic(o.filledOutputAmount, outDec) + ' ' + outSym + ' (' + o.numberOfFills + ' fills)'
+    );
+    kb.text('🗑️ Cancel #' + (i + 1), 'cx:' + o.pubkey).row();
+  }
+  await ctx.api.editMessageText(ctx.chat.id, msg.message_id, '📋 Open orders\n\n' + lines.join('\n\n'), { reply_markup: kb });
+});
+
+bot.callbackQuery(/^cx:(.+)$/, async (ctx) => {
+  const order = ctx.match[1];
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText('🛠️ Cancelling order…');
+  const built = await hermes('/v1/orders/cancel', { order });
+  const { sig, status } = await signSendConfirm(built.transaction);
+  await ctx.editMessageText(STATUS_LABEL[status] + ' — order cancelled, remaining funds returned.\n\n🔗 https://solscan.io/tx/' + sig);
+});
+
 await bot.api.setMyCommands([
   { command: 'quote', description: 'Get best swap route, e.g. /quote 0.1 SOL USDC' },
   { command: 'balance', description: 'Show wallet SOL and USDC balances' },
+  { command: 'dca', description: 'Recurring buys, e.g. /dca 20 USDC SOL 4 1d' },
+  { command: 'limit', description: 'Limit order, e.g. /limit 10 USDC SOL 0.125' },
+  { command: 'orders', description: 'View and cancel open orders' },
   { command: 'wallet', description: 'Show the bot wallet address' },
   { command: 'help', description: 'How to use this bot' },
 ]);
