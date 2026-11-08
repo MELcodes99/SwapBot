@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { Bot, InlineKeyboard } from 'grammy';
 import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { createX402Client } from 'x402-solana/client';
+import bs58 from 'bs58';
 
 // ---------- config ----------
 const HERMES = 'https://hermes.swap.io';
@@ -199,7 +200,10 @@ bot.callbackQuery(/^go:(.+)$/, async (ctx) => {
     provider: p.best.provider.key,
     chainKey: 'sol',
   });
-  const sig = sub.transactionHash;
+  // Use the signature from the tx we signed; fall back to whatever Hermes returns.
+  const localSig = bs58.encode(tx.signatures[0]);
+  const sig = pick(sub, 'transactionHash', 'signature', 'txid', 'txHash', 'hash', 'data.transactionHash') || localSig;
+  console.log('submit-tx response:', JSON.stringify(sub));
 
   // Confirm via our own RPC (free) instead of paying for /v1/swap/status polls.
   const deadline = Date.now() + 60_000;
