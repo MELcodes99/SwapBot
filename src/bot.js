@@ -12,14 +12,14 @@ const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 50);
 const MAX_FEE_ATOMIC = BigInt(process.env.MAX_FEE_ATOMIC || 10_000); // $0.01 cap per API call
 const QUOTE_TTL_MS = 30_000;
 
-if (!process.env.BOT_TOKEN || !process.env.PAYER_KEYPAIR || !OWNER) {
+if (!process.env.BOT_TOKEN || !(process.env.PAYER_KEYPAIR || process.env.PAYER_KEYPAIR_JSON) || !OWNER) {
   console.error('Missing BOT_TOKEN, PAYER_KEYPAIR or OWNER_TELEGRAM_ID in .env');
   process.exit(1);
 }
 
 // Keypair is loaded from a file path and never printed or sent anywhere.
 const wallet = Keypair.fromSecretKey(
-  Uint8Array.from(JSON.parse(fs.readFileSync(process.env.PAYER_KEYPAIR, 'utf8')))
+  Uint8Array.from(JSON.parse(process.env.PAYER_KEYPAIR_JSON || fs.readFileSync(process.env.PAYER_KEYPAIR, 'utf8')))
 );
 const connection = new Connection(RPC, 'confirmed');
 
