@@ -1,0 +1,16 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+bot-wallet.json
+*-wallet.json
+*keypair*.json
+id.json
+
+# helper that prints the private key
+showkey.js
+
+# deps / system
+node_modules/
+.DS_Store
+npm-debug.log*
