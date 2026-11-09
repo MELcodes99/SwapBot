@@ -93,6 +93,12 @@ async function hermes(path, body) {
 
 // ---------- bot ----------
 const bot = new Bot(process.env.BOT_TOKEN);
+
+// Log anything that would otherwise crash the process silently.
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e?.description || e?.message || e));
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e?.description || e?.message || e));
+// Heartbeat so the Render logs show the bot is alive.
+setInterval(() => console.log('[heartbeat]', new Date().toISOString()), 30 * 60_000);
 const pending = new Map(); // id -> { best, from, to, amount, expires }
 
 // Only the owner can use this bot: it spends from your wallet.
